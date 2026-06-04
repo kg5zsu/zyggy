@@ -27,7 +27,7 @@ Zyggy is a simple, fast, and user-friendly graphical interface for basic ZFS adm
 - zpool get all
 
 
-![zyggy screenshot](https://github.com/manoeldesouza/zyggy/blob/master/screenshot/zyggy.png)
+![zyggy screenshot](https://github.com/kg5zsu/zyggy/blob/master/screenshot/zyggy.png)
 
 
 
