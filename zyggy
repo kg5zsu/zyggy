@@ -1,13 +1,25 @@
 #!/usr/bin/env python3
 
 import json
+import os
 import re
+import sys
 import gi
 
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, GLib
 from subprocess import Popen, PIPE
 from threading import Thread
+
+IS_ROOT = os.geteuid() == 0
+ZFS_CMDS = {"zfs", "zpool", "smartctl"}
+
+def elevated_cmd(cmd):
+    if IS_ROOT:
+        return cmd
+    if cmd and os.path.basename(cmd[0]) in ZFS_CMDS:
+        return ["pkexec"] + cmd
+    return cmd
 
 DATASETS = 0
 SNAPSHOTS = 1
@@ -132,7 +144,7 @@ def has_zfs():
 
 def run_cmd(cmd):
     try:
-        p = Popen(cmd, stdout=PIPE, stderr=PIPE)
+        p = Popen(elevated_cmd(cmd), stdout=PIPE, stderr=PIPE)
         out, err = p.communicate()
         return out.decode('utf-8').strip(), err.decode('utf-8').strip(), p.returncode
     except Exception as e:
@@ -193,7 +205,7 @@ def get_pool_disks(pool):
     for line in out.splitlines():
         m = re.search(r'/dev/([a-z]+[a-z0-9]*(?:_[a-z0-9]+)?)', line)
         if m:
-            d = m.group(1)
+            d = re.sub(r'(p?\d+)$', '', m.group(1))
             if d not in seen and d != pool:
                 seen.add(d)
                 disks.append(d)
@@ -231,9 +243,30 @@ class ModePage:
         scrolled.set_vexpand(True)
         scrolled.add(self.treeview)
 
+        self.empty_state = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.empty_state.set_valign(Gtk.Align.CENTER)
+        self.empty_state.set_halign(Gtk.Align.CENTER)
+        if self.mode == POOLS:
+            lbl = Gtk.Label()
+            lbl.set_markup("<b>No pools found</b>")
+            self.empty_state.pack_start(lbl, False, False, 0)
+            hint = Gtk.Label(label="Import an existing pool or create a new one:")
+            self.empty_state.pack_start(hint, False, False, 0)
+            btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            import_btn = Gtk.Button.new_with_label("Import Pool")
+            import_btn.connect("clicked", lambda b: self.app.handle_action("import_pool"))
+            btn_box.pack_start(import_btn, False, False, 0)
+            create_btn = Gtk.Button.new_with_label("Create Pool")
+            create_btn.connect("clicked", lambda b: self.app.handle_action("create_pool"))
+            btn_box.pack_start(create_btn, False, False, 0)
+            self.empty_state.pack_start(btn_box, False, False, 0)
+            self.empty_state.show_all()
+            self.empty_state.set_visible(False)
+
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         box.pack_start(self.toolbar_box, False, False, 0)
         box.pack_start(scrolled, True, True, 0)
+        box.pack_start(self.empty_state, True, True, 0)
         box.pack_start(self.status_label, False, False, 0)
         self.widget = box
 
@@ -255,6 +288,10 @@ class ModePage:
         self.liststore.clear()
         for row in rows:
             self.liststore.append(row)
+        has_empty_state = len(self.empty_state.get_children()) > 0
+        if has_empty_state:
+            self.treeview.set_visible(len(rows) > 0)
+            self.empty_state.set_visible(len(rows) == 0)
         self.status_label.set_text(f"{len(rows)} {MODE_LABELS[self.mode].lower()}")
 
     def get_selected(self):
@@ -293,6 +330,11 @@ class HealthPage:
         refresh_btn.set_tooltip_text("Refresh")
         refresh_btn.connect("clicked", lambda b: self.refresh())
         sel_box.pack_start(refresh_btn, False, False, 0)
+        self.import_btn = Gtk.Button.new_from_icon_name("document-import", Gtk.IconSize.MENU)
+        self.import_btn.set_tooltip_text("Import Pool")
+        self.import_btn.connect("clicked", lambda b: self.import_pool())
+        self.import_btn.set_no_show_all(True)
+        sel_box.pack_start(self.import_btn, False, False, 0)
         self.widget.pack_start(sel_box, False, False, 0)
 
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
@@ -339,23 +381,62 @@ class HealthPage:
 
     def refresh(self):
         self.pool_combo.remove_all()
+        self.import_btn.hide()
         out, err, rc = run_cmd(["zpool", "list", "-H", "-o", "name"])
         pools = out.splitlines() if rc == 0 else []
         for p in pools:
             self.pool_combo.append_text(p)
         if pools:
             self.pool_combo.set_active(0)
+        else:
+            self.pool_combo.append_text("-- no pools imported --")
+            self.pool_combo.set_active(0)
+            self.import_pool_names = []
+            import_out, import_err, import_rc = run_cmd(["zpool", "import"])
+            if import_rc == 0 and import_out.strip():
+                for line in import_out.splitlines():
+                    m = re.search(r'^\s*pool:\s+(.+)$', line)
+                    if m:
+                        self.import_pool_names.append(m.group(1).strip())
+                if self.import_pool_names:
+                    names = ", ".join(self.import_pool_names)
+                    msg = f"Unimported pools: {names}"
+                    self.import_btn.show()
+                else:
+                    msg = "No ZFS pools found."
+            elif import_rc != 0 and ("permission denied" in import_err or "not authorized" in import_err):
+                msg = "Permission denied. Run with: pkexec ./zyggy"
+            else:
+                msg = "No ZFS pools found."
+            for text_view in (self.status_text, self.scrub_text, self.io_text):
+                text_view.get_buffer().set_text(msg)
+            self.smart_text.get_buffer().set_text("No pool selected.")
+            return
         self.update_status()
         self.update_scrub()
         self.update_smart()
         self.update_iostat()
+
+    def import_pool(self):
+        names = getattr(self, "import_pool_names", [])
+        if not names:
+            self.app.message_dialog("No unimported pools found.")
+            return
+        choices = "\n".join(f"{i+1}. {n}" for i, n in enumerate(names))
+        idx = self.app.input_dialog("Import Pool", f"Enter pool name to import:\n{choices}", names[0])
+        if idx and idx in names:
+            self.app.run_zfs_cmd(["zpool", "import", idx])
+            self.refresh()
+        elif idx:
+            self.app.run_zfs_cmd(["zpool", "import", idx])
+            self.refresh()
 
     def get_pool(self):
         return self.pool_combo.get_active_text()
 
     def run_action(self, action):
         pool = self.get_pool()
-        if not pool:
+        if not pool or pool.startswith("--"):
             self.app.error_dialog("Select a pool first.")
             return
         if action == "scrub":
@@ -369,7 +450,7 @@ class HealthPage:
             self.notebook.set_current_page(0)
         elif action == "iostat":
             def io_thread():
-                out, err, rc = run_cmd(["zpool", "iostat", "-v", pool, "1", "5"])
+                out, err, rc = run_cmd(["zpool", "iostat", "-v", pool])
                 GLib.idle_add(self._set_io_text, out if rc == 0 else err)
             Thread(target=io_thread, daemon=True).start()
         elif action == "smart":
@@ -423,31 +504,67 @@ class HealthPage:
         def smart_thread():
             results = []
             for d in disks:
-                for flag in ["", "-d sat", "-d scsi"]:
+                for flag in ["", "-d auto", "-d sat", "-d usbjmicron", "-d scsi"]:
                     cmd = ["smartctl"] + (flag.split() if flag else []) + ["-a", f"/dev/{d}"]
                     out, err, rc = run_cmd(cmd)
-                    if rc == 0 or "SMART" in out or "SMART" in err:
-                        temp = health = realloc = pending = "?"
-                        for line in (out + "\n" + err).splitlines():
+                    combined = out + "\n" + err
+                    if rc == 0 or "SMART" in combined or "Device Model" in combined:
+                        info = {}
+                        for line in combined.splitlines():
+                            if "Device Model:" in line:
+                                info["Model"] = line.split(":", 1)[1].strip()
+                            if "Serial Number:" in line:
+                                info["Serial"] = line.split(":", 1)[1].strip()
+                            if "Firmware Version:" in line:
+                                info["Firmware"] = line.split(":", 1)[1].strip()
                             if "overall-health" in line:
-                                health = line.split()[-1]
-                            if "Temperature_Celsius" in line:
-                                parts = line.split()
-                                if len(parts) >= 10:
-                                    temp = parts[9]
-                            if "Reallocated_Sector_Ct" in line:
-                                parts = line.split()
-                                if len(parts) >= 10:
-                                    realloc = parts[9]
-                            if "Current_Pending_Sector" in line:
-                                parts = line.split()
-                                if len(parts) >= 10:
-                                    pending = parts[9]
+                                info["Health"] = line.split()[-1]
+                        for attr, label in [
+                            ("Power_On_Hours", "Power-On Hours"),
+                            ("Temperature_Celsius", "Temperature"),
+                            ("Reallocated_Sector_Ct", "Reallocated Sectors"),
+                            ("Current_Pending_Sector", "Pending Sectors"),
+                            ("Offline_Uncorrectable", "Offline Uncorrectable"),
+                            ("UDMA_CRC_Error_Count", "UDMA CRC Errors"),
+                            ("Raw_Read_Error_Rate", "Read Error Rate"),
+                            ("Spin_Up_Time", "Spin-Up Time"),
+                            ("Power_Cycle_Count", "Power Cycles"),
+                            ("Start_Stop_Count", "Start/Stop Count"),
+                            ("Load_Cycle_Count", "Load Cycles"),
+                            ("Reported_Uncorrect", "Reported Uncorrect"),
+                            ("Command_Timeout", "Command Timeout"),
+                            ("Reallocated_Event_Count", "Reallocated Events"),
+                            ("Spin_Retry_Count", "Spin Retries"),
+                        ]:
+                            for line in combined.splitlines():
+                                if attr in line:
+                                    parts = line.split()
+                                    if len(parts) >= 10:
+                                        raw = parts[9]
+                                        if attr == "Power_On_Hours":
+                                            raw = raw.rstrip("h")
+                                        info[label] = raw
+                                    break
                         results.append(f"/dev/{d}")
-                        results.append(f"  Health: {health}  Temp: {temp}°C")
-                        results.append(f"  Reallocated: {realloc}  Pending: {pending}")
+                        if "Model" in info:
+                            results.append(f"  {info['Model']}")
+                        if "Serial" in info:
+                            results.append(f"  S/N: {info['Serial']}")
+                        if "Health" in info:
+                            h = info["Health"]
+                            icon = "✓" if h == "PASSED" else "✗"
+                            results.append(f"  Health: {h} {icon}")
+                        for label in ["Temperature", "Power-On Hours", "Power Cycles",
+                                      "Reallocated Sectors", "Pending Sectors",
+                                      "Offline Uncorrectable", "UDMA CRC Errors",
+                                      "Start/Stop Count", "Load Cycles",
+                                      "Read Error Rate", "Spin-Up Time",
+                                      "Spin Retries", "Reported Uncorrect",
+                                      "Command Timeout", "Reallocated Events"]:
+                            if label in info:
+                                results.append(f"  {label}: {info[label]}")
                         if flag:
-                            results.append(f"  (used flag: {flag})")
+                            results.append(f"  (smartctl flag: {flag})")
                         results.append("")
                         break
                 else:
@@ -460,6 +577,15 @@ class HealthPage:
         buf = self.smart_text.get_buffer()
         buf.set_text(text)
         self.notebook.set_current_page(2)
+
+    def update_iostat(self):
+        pool = self.get_pool()
+        if not pool:
+            return
+        def io_thread():
+            out, err, rc = run_cmd(["zpool", "iostat", "-v", pool])
+            GLib.idle_add(self._set_io_text, out if rc == 0 else err)
+        Thread(target=io_thread, daemon=True).start()
 
 
 class ZyggyApp:
@@ -554,7 +680,7 @@ class ZyggyApp:
             return [
                 ("create", "document-new", "Create Dataset"),
                 ("snapshot", "camera-photo", "Create Snapshot"),
-                ("rename", "edit-rename", "Rename"),
+                ("rename", "document-edit", "Rename"),
                 ("clone", "edit-copy", "Clone"),
                 ("promote", "go-up", "Promote"),
                 ("rollback", "edit-undo", "Rollback"),
@@ -563,7 +689,7 @@ class ZyggyApp:
             ]
         elif self.current_mode == SNAPSHOTS:
             return [
-                ("rename", "edit-rename", "Rename"),
+                ("rename", "document-edit", "Rename"),
                 ("clone", "edit-copy", "Clone"),
                 ("rollback", "edit-undo", "Rollback"),
                 ("delete", "edit-delete", "Destroy"),
@@ -573,7 +699,7 @@ class ZyggyApp:
             return [
                 ("create", "document-new", "Create Volume"),
                 ("snapshot", "camera-photo", "Create Snapshot"),
-                ("rename", "edit-rename", "Rename"),
+                ("rename", "document-edit", "Rename"),
                 ("clone", "edit-copy", "Clone"),
                 ("promote", "go-up", "Promote"),
                 ("delete", "edit-delete", "Destroy"),
@@ -582,9 +708,9 @@ class ZyggyApp:
         elif self.current_mode == POOLS:
             return [
                 ("create_pool", "drive-harddisk", "Create Pool"),
-                ("import_pool", "document-open", "Import Pool"),
+                ("import_pool", "document-import", "Import Pool"),
                 ("export_pool", "media-eject", "Export Pool"),
-                ("rename", "edit-rename", "Rename"),
+                ("rename", "document-edit", "Rename"),
                 ("scrub", "system-run", "Scrub"),
                 ("status", "utilities-system-monitor", "Status"),
                 ("upgrade", "system-upgrade", "Upgrade"),
@@ -749,7 +875,7 @@ class ZyggyApp:
         pools = [l.strip() for l in out.splitlines() if l.strip() and not l.startswith("pool:") and not l.startswith(" ")]
         pool_names = []
         for line in out.splitlines():
-            m = re.search(r'^\s+pool:\s+(.+)$', line)
+            m = re.search(r'^\s*pool:\s+(.+)$', line)
             if m:
                 pool_names.append(m.group(1).strip())
         if not pool_names:
@@ -1279,8 +1405,12 @@ class ZyggyApp:
 
 
 if __name__ == "__main__":
-    if has_zfs():
-        app = ZyggyApp()
-        Gtk.main()
-    else:
+    if not has_zfs():
         print("ZFS not found")
+        print("Install ZFS: sudo apt install zfsutils-linux")
+        sys.exit(1)
+    if not IS_ROOT:
+        print("Warning: not running as root. ZFS commands will use pkexec.")
+        print("Run with: pkexec ./zyggy  or  sudo ./zyggy  to avoid repeated prompts.")
+    app = ZyggyApp()
+    Gtk.main()
