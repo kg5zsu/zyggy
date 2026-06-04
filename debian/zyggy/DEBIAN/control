@@ -1,0 +1,20 @@
+Package: zyggy
+Version: 0.3-1
+Architecture: all
+Maintainer: Thomas Brooks <tbrooks@unknown>
+Installed-Size: 64
+Depends: python3, python3-gi, gir1.2-gtk-3.0, zfsutils-linux
+Recommends: smartmontools
+Section: admin
+Priority: optional
+Homepage: https://github.com/manoeldesouza/zyggy
+Description: ZFS Administration GUI
+ Zyggy is a very simple GUI for basic ZFS administration.
+ It provides graphical access for most frequently used ZFS and
+ ZPOOL commands, including:
+  - Dataset, volume, and snapshot management
+  - Pool operations (create, destroy, status, scrub)
+  - Disk and health monitoring (SMART, I/O stats)
+ .
+ It wraps the ZFS command-line tools (zfs, zpool) behind an
+ intuitive GTK3 interface.

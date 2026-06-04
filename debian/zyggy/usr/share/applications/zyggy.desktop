@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Zyggy
+GenericName=ZFS Administration GUI
+Comment=Manage ZFS pools, datasets, and snapshots visually (requires root)
+Exec=pkexec zyggy
+Terminal=false
+Icon=drive-harddisk
+Categories=System;Filesystem;Utility;
+StartupNotify=true
