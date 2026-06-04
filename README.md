@@ -20,7 +20,7 @@ Commands available to date:
  - zpool get all
 
 
-![zyggy](https://github.com/manoeldesouza/zyggy/blob/master/screenshot/zyggy.png)
+![zyggy](https://github.com/kg5zsu/zyggy/blob/master/screenshot/zyggy.png)
 
 
 Zyggy is the GTK version of a previous ncurses-based development called ZC (ZFS commander) available in
